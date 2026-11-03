@@ -11,27 +11,80 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <dev/usb/usb.h>
 #include <dev/usb/usb_ioctl.h>
 #include <ps5/klog.h>
 
-#define REJECT_MAX  32
-#define NAME_LEN    16
+#define REJECT_MAX       32
+#define NAME_LEN         16
+#define PROBE_RETRY_US   1000000ULL   /* re-probe a device that failed to open */
 
 static UsbDevice usb_devices[USB_MAX_DEVICES];
 
-/* Devices whose descriptor we read and that no driver supports. Rebuilt on
- * every scan from the nodes still present, so a reused address is retried.
- * Keeps the fast rescan from re-opening the PS5's internal USB devices. */
-static char rejected[REJECT_MAX][NAME_LEN];
-static int  rejected_count;
+/* Devices we already looked at, rebuilt on every scan from the nodes still
+ * present. Two kinds of rejection, because they mean different things: an
+ * unsupported device stays rejected for as long as its node exists, while a
+ * failed probe (endpoint not published yet during enumeration, transient open
+ * error) is retried after a backoff instead of hiding the device for good. */
+typedef struct {
+    char     name[NAME_LEN];
+    bool     permanent;
+    uint64_t retry_us;
+} RejectEntry;
+
+static RejectEntry rejected[REJECT_MAX];
+static int         rejected_count;
 
 int usb_init(void)
 {
     memset(usb_devices, 0, sizeof(usb_devices));
+    memset(rejected, 0, sizeof(rejected));
     rejected_count = 0;
     return 0;
+}
+
+static uint64_t usb_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
+
+static void reject_unsupported(const char *name)
+{
+    if (rejected_count >= REJECT_MAX) return;
+
+    RejectEntry *e = &rejected[rejected_count++];
+    snprintf(e->name, NAME_LEN, "%s", name);
+    e->permanent = true;
+    e->retry_us  = 0;
+}
+
+static void reject_probe(const char *name, uint64_t now)
+{
+    if (rejected_count >= REJECT_MAX) return;
+
+    RejectEntry *e = &rejected[rejected_count++];
+    snprintf(e->name, NAME_LEN, "%s", name);
+    e->permanent = false;
+    e->retry_us  = now + PROBE_RETRY_US;
+}
+
+static const RejectEntry *reject_find(const RejectEntry *table, int count,
+                                      const char *name)
+{
+    for (int i = 0; i < count; i++)
+        if (strcmp(table[i].name, name) == 0)
+            return &table[i];
+    return NULL;
+}
+
+static void reject_carry(const RejectEntry *e)
+{
+    if (rejected_count < REJECT_MAX)
+        rejected[rejected_count++] = *e;
 }
 
 static bool is_held(const char *name)
@@ -42,13 +95,7 @@ static bool is_held(const char *name)
     return false;
 }
 
-static void reject(const char *name)
-{
-    if (rejected_count < REJECT_MAX)
-        snprintf(rejected[rejected_count++], NAME_LEN, "%s", name);
-}
-
-static int try_open(const char *name, Controller *ctrl)
+static int try_open(const char *name, Controller *ctrl, uint64_t now)
 {
     char path[64];
     snprintf(path, sizeof(path), "/dev/usb/%s.0", name);
@@ -67,7 +114,7 @@ static int try_open(const char *name, Controller *ctrl)
 
     const ControllerDriver *drv = controller_driver_find(vid, pid);
     if (!drv) {
-        reject(name);
+        reject_unsupported(name);
         close(cfd);
         return -1;
     }
@@ -101,10 +148,10 @@ static int try_open(const char *name, Controller *ctrl)
         out_ep = ep;
     }
     if (in_fd < 0) {
-        klog_printf("[AnyController] usb %s: no readable endpoint, skipping device\n", name);
+        klog_printf("[AnyController] usb %s: no readable endpoint yet, retrying\n", name);
         if (out_fd >= 0) close(out_fd);
         close(cfd);
-        reject(name);
+        reject_probe(name, now);
         return -1;
     }
     int one = 1;
@@ -135,26 +182,32 @@ int usb_open_next_controller(Controller *ctrl)
     DIR *d = opendir("/dev");
     if (!d) return -1;
 
-    char prev[REJECT_MAX][NAME_LEN];
+    RejectEntry prev[REJECT_MAX];
     int  prev_count = rejected_count;
     memcpy(prev, rejected, sizeof(prev));
     rejected_count = 0;
 
+    uint64_t now = usb_now_us();
     int result = -1;
     struct dirent *e;
     while ((e = readdir(d))) {
         if (strncmp(e->d_name, "ugen", 4) != 0) continue;
         const char *name = e->d_name + 4;
 
-        bool was_rejected = false;
-        for (int i = 0; i < prev_count && !was_rejected; i++)
-            was_rejected = strcmp(prev[i], name) == 0;
-        if (was_rejected) {
-            reject(name);
+        /* Carry forward what we already know about this node, so the 25 ms
+         * rescan neither re-reads descriptors of unsupported devices nor
+         * retries a failed probe before its backoff expires. */
+        const RejectEntry *was = reject_find(prev, prev_count, name);
+        if (was && was->permanent) {
+            reject_carry(was);
+            continue;
+        }
+        if (was && now < was->retry_us) {
+            reject_carry(was);
             continue;
         }
         if (result == 0 || is_held(name)) continue;
-        if (try_open(name, ctrl) == 0) result = 0;
+        if (try_open(name, ctrl, now) == 0) result = 0;
     }
     closedir(d);
     return result;
