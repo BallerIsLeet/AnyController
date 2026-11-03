@@ -79,9 +79,13 @@ static bool is_payload_process(pid_t pid)
 }
 
 /* Stop a previously deployed instance so two copies don't fight over the
- * same USB device, then record our own pid. */
-static void take_over_previous_instance(void)
+ * same USB device, then record our own pid. Returns true when no previous
+ * instance is left running, i.e. the pads it recorded in the ledger are stale
+ * and safe to remove. */
+static bool take_over_previous_instance(void)
 {
+    bool reap_stale = true;
+
     FILE *f = fopen(PID_FILE, "r");
     if (f) {
         int old = 0;
@@ -91,6 +95,12 @@ static void take_over_previous_instance(void)
             kill(old, SIGTERM);
             for (int i = 0; i < 50 && kill(old, 0) == 0; i++)
                 usleep(20000);
+            if (kill(old, 0) == 0) {
+                /* It refused to go; deleting its pads would fight a live
+                 * process, so leave them registered. */
+                klog_printf("[AnyController] previous instance pid=%d still running\n", old);
+                reap_stale = false;
+            }
         }
         fclose(f);
     }
@@ -99,6 +109,7 @@ static void take_over_previous_instance(void)
         fprintf(f, "%d\n", getpid());
         fclose(f);
     }
+    return reap_stale;
 }
 
 #define RETRY_BACKOFF_US  2000000ULL
@@ -106,6 +117,8 @@ static void take_over_previous_instance(void)
 #define KEEPALIVE_US      1000000ULL
 #define STATS_WINDOW_US   5000000ULL
 #define STALL_US          500000ULL
+#define SUBMIT_FAIL_LIMIT 30           /* failed inserts before rebuilding the pad (~250 ms) */
+#define VPAD_RETRY_US     2000000ULL   /* wait this long before rebuilding the pad again */
 
 typedef struct {
     uint64_t last_report_us;
@@ -115,6 +128,8 @@ typedef struct {
     unsigned reports;
     unsigned total_reports;
     unsigned submits_failed;
+    unsigned submit_fail_streak;   /* consecutive HID_INSERT_DATA failures */
+    uint64_t vpad_retry_us;        /* earliest time to rebuild the virtual pad */
     bool     stalled;
     bool     ps_down;
 } SlotStats;
@@ -159,10 +174,41 @@ static void submit_neutral(int i)
     vpad_submit_input(vpads[i], &idle);
 }
 
+/* The kernel can invalidate a pad handle (account switch, system UI reset) and
+ * from then on every insert fails. Rebuild the pad on the same slot so the
+ * controller keeps working without the user re-sending the payload. */
+static void recover_vpad(int i, uint64_t now)
+{
+    if (now < stats[i].vpad_retry_us)
+        return;
+
+    if (vpads[i])
+        vpad_destroy(vpads[i]);
+    vpads[i] = vpad_create(VPAD_DEFAULT_USER);
+
+    stats[i].submit_fail_streak = 0;
+    stats[i].ps_down = false;
+    stats[i].vpad_retry_us = now + VPAD_RETRY_US;
+
+    if (!vpads[i])
+        klog_printf("[AnyController] slot %d: could not rebuild virtual pad errno=%d\n",
+                    i, errno);
+    else
+        klog_printf("[AnyController] slot %d: virtual pad rebuilt -> handle=%d\n",
+                    i, vpads[i]->handle);
+}
+
 /* USB vanished: keep the virtual DualSense registered for a moment so a
  * short controller re-enumeration doesn't look like an unplug to the PS5. */
 static void begin_grace(int i, uint64_t now)
 {
+    /* Nothing to hold on to when the pad could not be rebuilt: drop the slot
+     * outright, so the resume path can never touch a NULL virtual pad. */
+    if (!vpads[i]) {
+        drop_slot(i, "USB lost without a virtual pad");
+        return;
+    }
+
     klog_printf("[AnyController] slot %d: USB lost, holding DualSense for %llu ms\n",
                 i, (unsigned long long)(RESUME_GRACE_US / 1000));
     release_usb(i);
@@ -326,8 +372,16 @@ static void poll_slot(int i, uint64_t now)
                         input.ps_button ? "pressed" : "released");
         }
         input.timestamp_us = now;
-        if (vpad_submit_input(vpads[i], &input) != 0 && st->submits_failed++ == 0)
-            klog_printf("[AnyController] slot %d: input submit failed errno=%d\n", i, errno);
+        if (!vpads[i]) {
+            recover_vpad(i, now);
+        } else if (vpad_submit_input(vpads[i], &input) == 0) {
+            st->submit_fail_streak = 0;
+        } else {
+            if (st->submits_failed++ == 0)
+                klog_printf("[AnyController] slot %d: input submit failed errno=%d\n", i, errno);
+            if (++st->submit_fail_streak >= SUBMIT_FAIL_LIMIT)
+                recover_vpad(i, now);
+        }
     }
 
     if (now - st->last_keepalive_us >= KEEPALIVE_US) {
@@ -353,7 +407,7 @@ int main(void)
                 ANYCONTROLLER_VERSION_MAJOR, ANYCONTROLLER_VERSION_MINOR,
                 ANYCONTROLLER_VERSION_PATCH, getpid());
 
-    take_over_previous_instance();
+    bool reap_stale_vpads = take_over_previous_instance();
     controller_drivers_init();
 
     if (vpad_init() != 0) {
@@ -361,6 +415,11 @@ int main(void)
         notify("AnyController: /dev/hid failed!");
         return 1;
     }
+
+    /* Pads a crashed instance registered are still attached to the system and
+     * would show up as phantom DualSenses; remove them before adding ours. */
+    if (reap_stale_vpads)
+        vpad_reap_stale();
 
     usb_init();
     memset(controllers, 0, sizeof(controllers));
