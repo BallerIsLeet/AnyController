@@ -35,6 +35,10 @@
 /* User id FGG-XSense registers pads under; verified on hardware. */
 #define VPAD_DEFAULT_USER 1
 
+/* Handles of the pads we register are recorded here, so that a payload killed
+ * without cleaning up leaves nothing behind for the next run to trip over. */
+#define VPAD_LEDGER_FILE "/data/anycontroller.vpads"
+
 /* Request taken by HID_ADD_DEVICE and HID_INSERT_DATA */
 typedef struct {
     uint32_t  cmd;       /* HID_CMD_ADD, or the device handle for insert */
@@ -92,8 +96,14 @@ Vpad *vpad_create(uint32_t user_id);
 /* Translate and submit one frame of input. Returns 0 on success. */
 int vpad_submit_input(Vpad *vpad, const NormalizedInput *input);
 
-/* Remove a virtual pad. A pad left registered outlives the payload. */
+/* Remove a virtual pad. A pad left registered by a payload that was killed
+ * (SIGKILL, crash) is removed by the next instance; see vpad_reap_stale. */
 void vpad_destroy(Vpad *vpad);
+
+/* Remove the pads a previous instance recorded in the ledger and clear the
+ * ledger. Call once after vpad_init(), before creating any pad: handles are
+ * not enumerable, so this is the only way back to a clean state. */
+void vpad_reap_stale(void);
 
 /* Remove all pads and close /dev/hid. */
 void vpad_shutdown(void);

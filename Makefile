@@ -22,6 +22,7 @@ SRCS = \
     src/vpad.c \
     src/controllers/switch_pro.c \
     src/controllers/xbox360.c \
+    src/controllers/ds4.c \
     src/transport/usb.c
 
 OBJS = $(SRCS:.c=.o)

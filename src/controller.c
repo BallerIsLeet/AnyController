@@ -5,6 +5,7 @@
 #include "../include/controller.h"
 #include "../include/controllers/switch_pro.h"
 #include "../include/controllers/xbox360.h"
+#include "../include/controllers/ds4.h"
 
 #include <stddef.h>
 
@@ -45,4 +46,6 @@ void controller_drivers_init(void)
     driver_count = 0;
     controller_driver_register(switch_pro_get_driver());
     controller_driver_register(xbox360_get_driver());
+    controller_driver_register(ds4_get_driver(0));
+    controller_driver_register(ds4_get_driver(1));
 }

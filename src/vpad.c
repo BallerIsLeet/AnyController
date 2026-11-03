@@ -4,13 +4,32 @@
 
 #include "../include/vpad.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <ps5/klog.h>
+
+#define STALE_MAX  16   /* handles remembered for crashed runs */
 
 static int  g_hid_fd = -1;
 static Vpad g_vpads[MAX_CONTROLLERS];
+
+/* Rewrite the ledger from the pads we hold open. Pad handles are not
+ * enumerable, so this file is the only record of a pad that a killed payload
+ * left registered with the kernel. */
+static void ledger_save(void)
+{
+    FILE *f = fopen(VPAD_LEDGER_FILE, "w");
+    if (!f) return;
+
+    for (int i = 0; i < MAX_CONTROLLERS; i++)
+        if (g_vpads[i].active)
+            fprintf(f, "%d\n", g_vpads[i].handle);
+
+    fclose(f);
+}
 
 int vpad_init(void)
 {
@@ -58,6 +77,7 @@ Vpad *vpad_create(uint32_t user_id)
     vpad->report.active        = 1;
     vpad->report.orient_w      = 1.0f;
 
+    ledger_save();
     return vpad;
 }
 
@@ -123,6 +143,40 @@ void vpad_destroy(Vpad *vpad)
 
     vpad->active = false;
     vpad->handle = -1;
+
+    ledger_save();
+}
+
+void vpad_reap_stale(void)
+{
+    if (g_hid_fd < 0) return;
+
+    FILE *f = fopen(VPAD_LEDGER_FILE, "r");
+    if (!f) return;
+
+    int32_t handles[STALE_MAX];
+    int count = 0;
+    while (count < STALE_MAX && fscanf(f, "%d", &handles[count]) == 1)
+        count++;
+    fclose(f);
+
+    int removed = 0;
+    for (int i = 0; i < count; i++) {
+        if (handles[i] <= 0) continue;
+
+        HidDelRequest del;
+        memset(&del, 0, sizeof(del));
+        del.cmd    = HID_CMD_DEL;
+        del.handle = (uint32_t)handles[i];
+        if (ioctl(g_hid_fd, HID_DEL_DEVICE, &del) == 0)
+            removed++;
+    }
+
+    if (count)
+        klog_printf("[AnyController] removed %d of %d stale virtual pad(s)\n",
+                    removed, count);
+
+    ledger_save();
 }
 
 void vpad_shutdown(void)
